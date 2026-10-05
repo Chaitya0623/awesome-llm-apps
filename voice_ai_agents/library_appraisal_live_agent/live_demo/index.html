@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Library Appraisal Live Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600&family=Patrick+Hand&family=Inter:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css?v=ledger-1" />
+  </head>
+  <body>
+    <div class="desk">
+      <header class="desk-bar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>Library Appraisal Live Agent</h1>
+            <p id="modelLabel" class="brand-sub">Connecting to Gemini</p>
+          </div>
+        </div>
+        <div class="bar-actions">
+          <form id="localeForm" class="locale-form">
+            <input id="localeInput" type="text" autocomplete="off" placeholder="City, Country" aria-label="Pricing location" />
+            <button type="submit" class="ghost-button">Set prices</button>
+          </form>
+          <button id="openPacket" class="ghost-button" type="button">Appraisal packet</button>
+        </div>
+      </header>
+
+      <main class="desk-layout">
+        <aside class="side media-column" aria-label="Live call and camera">
+          <section class="card call-card">
+            <div class="card-head">
+              <span class="card-kicker">Live call</span>
+              <span id="callStatus" class="pill">Offline</span>
+            </div>
+
+            <div id="cameraStage" class="camera-stage" hidden>
+              <video id="cameraPreview" autoplay muted playsinline></video>
+              <span id="sweepTag" class="camera-tag" hidden><span class="rec-dot" aria-hidden="true"></span> Scanning shelves · <span id="frameCount">0</span> frames</span>
+            </div>
+
+            <div class="controls">
+              <button id="micButton" class="round-button" type="button" aria-label="Start live voice">
+                <span class="icon-mic" aria-hidden="true"></span>
+                <span class="round-label">Talk</span>
+              </button>
+              <button id="cameraButton" class="round-button" type="button" aria-label="Show the library on camera">
+                <span class="icon-camera" aria-hidden="true"></span>
+                <span class="round-label">Show camera</span>
+              </button>
+              <button id="sweepButton" class="round-button" type="button" aria-label="Start scanning shelves" disabled>
+                <span class="icon-sweep" aria-hidden="true"></span>
+                <span class="round-label">Sweep</span>
+              </button>
+              <button id="newAppraisalButton" class="round-button subtle" type="button" aria-label="Start a new appraisal">
+                <span class="icon-new" aria-hidden="true"></span>
+                <span class="round-label">New</span>
+              </button>
+            </div>
+          </section>
+          <section class="card team-card">
+            <div class="card-head">
+              <span class="card-kicker">Appraisal team</span>
+              <span class="card-hint">Working in the background while the call continues</span>
+            </div>
+            <ul id="teamFeed" class="team-feed" tabindex="0" aria-label="Appraisal team activity"></ul>
+          </section>
+        </aside>
+
+        <section class="notebook-wrap" aria-label="Appraisal ledger" tabindex="0">
+          <div class="notebook">
+            <div class="holes" aria-hidden="true"><span></span><span></span><span></span></div>
+            <div class="page-head">
+              <span id="pageLocale">Pricing location not set</span>
+              <span>Gemini 3.8 Live, appraisal ledger</span>
+            </div>
+
+            <div class="totals">
+              <div class="total main">
+                <span class="label">Contents value</span>
+                <span id="totalMid" class="figure">—</span>
+                <span id="totalRange" class="sub">Waiting for the first shelf</span>
+              </div>
+              <div class="total"><span class="label">Books</span><span id="bookCount" class="figure">0</span><span id="bookSub" class="sub">—</span></div>
+              <div class="total"><span class="label">Other contents</span><span id="itemCount" class="figure">0</span><span id="itemSub" class="sub">—</span></div>
+              <div class="total"><span class="label">Floor area</span><span id="floorArea" class="figure">—</span><span id="floorSub" class="sub">needs a wide room pass</span></div>
+            </div>
+            <p id="roomLine" class="room-line"></p>
+            <div id="stamp" class="stamp" hidden></div>
+
+            <h2 class="ledger-title">Books <span id="bookTally" class="tally"></span></h2>
+            <table class="ledger">
+              <thead><tr><th>Title</th><th class="author-col">Author</th><th class="num">Value</th></tr></thead>
+              <tbody id="bookRows"></tbody>
+            </table>
+            <p id="bookEmpty" class="empty-line">No spines read yet.</p>
+
+            <h2 class="ledger-title">Other contents <span id="itemTally" class="tally"></span></h2>
+            <table class="ledger">
+              <thead><tr><th>Item</th><th class="num">Qty</th><th class="num">Value</th></tr></thead>
+              <tbody id="itemRows"></tbody>
+            </table>
+            <p id="itemEmpty" class="empty-line">No furniture, art, or decor captured yet.</p>
+
+          </div>
+        </section>
+
+        <aside class="side conversation-column" aria-label="Transcript and appraisal checklist">
+          <section class="card transcript-card">
+            <div class="card-head">
+              <span class="card-kicker">Transcript</span>
+            </div>
+            <div id="transcript" class="transcript" aria-live="polite" tabindex="0" role="region" aria-label="Conversation transcript"></div>
+            <form id="textForm" class="text-entry">
+              <input id="textInput" type="text" autocomplete="off" placeholder="Or type to the agent..." aria-label="Type a message" />
+              <button type="submit">Send</button>
+            </form>
+          </section>
+
+          <section class="card needed-card">
+            <div class="card-head">
+              <span class="card-kicker">Still needed</span>
+              <span id="readiness" class="pill neutral">0 of 5</span>
+            </div>
+            <ul id="neededList" class="needed-list" tabindex="0" aria-label="Appraisal checklist"></ul>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <dialog id="packetDialog" class="packet-dialog">
+      <div class="dialog-header">
+        <h2>Appraisal packet</h2>
+        <a id="downloadPacket" class="text-button" href="#" download>Download packet + evidence</a><button id="closePacket" type="button" aria-label="Close packet">Close</button>
+      </div>
+      <pre id="packetMarkdown"></pre><p>Local demo: nothing is sent to an insurer. Appraisals expire after 60 minutes without activity. Download to keep a copy.</p>
+    </dialog>
+
+    <canvas id="frameCanvas" hidden></canvas>
+    <script src="./app.js?v=ledger-1"></script>
+  </body>
+</html>
