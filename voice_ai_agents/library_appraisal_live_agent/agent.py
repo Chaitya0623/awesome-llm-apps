@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import uuid
 from typing import Any, AsyncGenerator, Callable
 
@@ -44,7 +45,11 @@ except ImportError:
     from schemas import AppraisalPacket, AppraisalRequest, RoomMeasurement, UnderwritingReview
 
 
-MODEL = "gemini-3.8-flash"
+MODEL = os.getenv("APPRAISAL_VALUATION_MODEL", "gemini-3.8-flash")
+# Pricing needs live web search. "openai" uses OpenAI's web_search tool instead of Gemini's Google
+# Search grounding, e.g. when the Google key has no search quota.
+PRICING_PROVIDER = os.getenv("APPRAISAL_PRICING_PROVIDER", "gemini").strip().lower()
+OPENAI_PRICING_MODEL = os.getenv("APPRAISAL_OPENAI_MODEL", "gpt-5.4-mini")
 APP_NAME = "library_appraisal_live_agent"
 
 
@@ -198,8 +203,7 @@ def _locale_line(queue: dict[str, Any]) -> tuple[str, str]:
     return place, locale.get("currency") or "USD"
 
 
-def _book_valuer_instruction(ctx: ReadonlyContext) -> str:
-    queue = ctx.state.get("pricing_queue") or {}
+def book_valuer_prompt(queue: dict[str, Any]) -> str:
     place, currency = _locale_line(queue)
     return f"""
 You are the book valuation specialist for a home-contents insurance appraisal in {place}.
@@ -208,8 +212,10 @@ Value each book below at its REPLACEMENT COST in {currency}: a used copy in good
 locally (local second-hand bookshops and local online marketplaces; local new retail when used copies
 are scarce). Use Google Search for current local listings. Do not invent listings or sources.
 
-If an edition could be a first edition, signed, or otherwise collectible, set collectible to true,
-keep low and mid at the common-edition price, and put the collectible price in high.
+Set collectible to true only when the details given (publisher, format, age) point to an early, first,
+signed, or limited edition AND you found listings for that edition priced well above the common one.
+A common in-print edition is false, even of a famous book. When true, keep low and mid at the
+common-edition price and put the collectible price in high.
 
 Books:
 {_queue_rows(queue, "books")}
@@ -220,8 +226,7 @@ sources (list of URLs you used), collectible (true or false).
 """
 
 
-def _contents_valuer_instruction(ctx: ReadonlyContext) -> str:
-    queue = ctx.state.get("pricing_queue") or {}
+def contents_valuer_prompt(queue: dict[str, Any]) -> str:
     place, currency = _locale_line(queue)
     return f"""
 You are the contents valuation specialist for a home-contents insurance appraisal in {place}.
@@ -230,12 +235,70 @@ Value ONE unit of each household item below at its REPLACEMENT COST in {currency
 equivalent item costs to buy locally today. For art and antiques use comparable local auction or
 gallery prices. Use Google Search for current local prices. Do not invent listings or sources.
 
+Set collectible to true only for original artwork, antiques, or pieces whose value depends on the
+maker, authenticity, or provenance. Prints, posters, reproductions, and ordinary furniture are false.
+
 Items:
 {_queue_rows(queue, "items")}
 
 Reply with ONLY a JSON array, one object per item, in the same order, with keys:
-id, low, mid, high (numbers in {currency}, for one unit), basis (a short note), sources (list of URLs).
+id, low, mid, high (numbers in {currency}, for one unit), basis (a short note), sources (list of URLs),
+collectible (true or false).
 """
+
+
+def _book_valuer_instruction(ctx: ReadonlyContext) -> str:
+    return book_valuer_prompt(ctx.state.get("pricing_queue") or {})
+
+
+def _contents_valuer_instruction(ctx: ReadonlyContext) -> str:
+    return contents_valuer_prompt(ctx.state.get("pricing_queue") or {})
+
+
+class OpenAIValuer(BaseAgent):
+    """Pricing node that searches the web through the OpenAI Responses API.
+
+    Writes the same state keys as the Gemini valuers (a JSON array reply plus cited URLs), so
+    ApplyValuations and everything after it are unchanged.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    kind: str
+    output_key: str
+    sources_key: str
+    prompt: Callable[[dict[str, Any]], str]
+    openai_model: str = OPENAI_PRICING_MODEL
+    client: Any = None  # injected in tests; otherwise created on first use
+
+    @override
+    async def _run_async_impl(
+        self, ctx: InvocationContext
+    ) -> AsyncGenerator[Event, None]:
+        queue = ctx.session.state.get("pricing_queue") or {}
+        if not queue.get(self.kind):
+            updates = {self.output_key: "[]"}
+        else:
+            if self.client is None:
+                from openai import AsyncOpenAI
+
+                self.client = AsyncOpenAI()
+            city = (queue.get("locale") or {}).get("city")
+            search = {"type": "web_search"}
+            if city:
+                search["user_location"] = {"type": "approximate", "city": city}
+            response = await self.client.responses.create(
+                model=self.openai_model, input=self.prompt(queue), tools=[search],
+            )
+            urls = [
+                annotation.url
+                for item in response.output if item.type == "message"
+                for part in item.content if part.type == "output_text"
+                for annotation in part.annotations if annotation.type == "url_citation"
+            ]
+            updates = {self.output_key: response.output_text, self.sources_key: urls}
+        ctx.session.state.update(updates)
+        yield _state_event(self.name, f"Priced {self.kind} with OpenAI web search.", updates)
 
 
 def create_normalizer(model: Any = MODEL) -> LlmAgent:
@@ -266,7 +329,13 @@ Extraction rules:
     )
 
 
-def create_book_valuer(model: Any = MODEL) -> LlmAgent:
+def create_book_valuer(model: Any = MODEL, provider: str = PRICING_PROVIDER) -> BaseAgent:
+    if provider == "openai":
+        return OpenAIValuer(
+            name="ValueBooksAtLocalPrices",
+            description="Values queued books at local replacement cost using OpenAI web search.",
+            kind="books", output_key="book_quotes", sources_key="book_sources", prompt=book_valuer_prompt,
+        )
     return LlmAgent(
         name="ValueBooksAtLocalPrices",
         model=model,
@@ -281,7 +350,13 @@ def create_book_valuer(model: Any = MODEL) -> LlmAgent:
     )
 
 
-def create_contents_valuer(model: Any = MODEL) -> LlmAgent:
+def create_contents_valuer(model: Any = MODEL, provider: str = PRICING_PROVIDER) -> BaseAgent:
+    if provider == "openai":
+        return OpenAIValuer(
+            name="ValueContentsAtLocalPrices",
+            description="Values queued non-book contents at local replacement cost using OpenAI web search.",
+            kind="items", output_key="item_quotes", sources_key="item_sources", prompt=contents_valuer_prompt,
+        )
     return LlmAgent(
         name="ValueContentsAtLocalPrices",
         model=model,
@@ -296,7 +371,9 @@ def create_contents_valuer(model: Any = MODEL) -> LlmAgent:
     )
 
 
-def create_workflow(*, include_normalizer: bool = True, model: Any = MODEL) -> SequentialAgent:
+def create_workflow(
+    *, include_normalizer: bool = True, model: Any = MODEL, provider: str = PRICING_PROVIDER,
+) -> SequentialAgent:
     """include_normalizer=False is the live path: the server seeds `inventory` from camera scans."""
     intake = [
         create_normalizer(model),
@@ -320,8 +397,8 @@ def create_workflow(*, include_normalizer: bool = True, model: Any = MODEL) -> S
                 output_key="pricing_queue",
                 summary="Selected entries to value.",
             ),
-            create_book_valuer(model),
-            create_contents_valuer(model),
+            create_book_valuer(model, provider),
+            create_contents_valuer(model, provider),
             FunctionNode(
                 name="ApplyValuations",
                 description="Parses valuation replies into price ranges and merges them into the inventory.",
@@ -363,6 +440,7 @@ async def run_appraisal_workflow(
     session_id: str | None = None,
     user_id: str = "live-ui",
     model: Any = MODEL,
+    provider: str = PRICING_PROVIDER,
 ) -> dict[str, Any]:
     """Run the ADK appraisal graph over a live inventory snapshot."""
 
@@ -378,7 +456,7 @@ async def run_appraisal_workflow(
     )
     runner = Runner(
         app_name=APP_NAME,
-        agent=create_workflow(include_normalizer=False, model=model),
+        agent=create_workflow(include_normalizer=False, model=model, provider=provider),
         session_service=session_service,
     )
     message = genai_types.Content(
@@ -420,6 +498,7 @@ async def run_appraisal_workflow(
 __all__ = [
     "APP_NAME",
     "MODEL",
+    "PRICING_PROVIDER",
     "create_workflow",
     "run_appraisal_workflow",
     "root_agent",

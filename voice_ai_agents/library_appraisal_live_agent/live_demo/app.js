@@ -48,6 +48,8 @@ let transcript = [];
 const seenEntries = new Set();
 
 const STATUS_LABEL = { pending: "queued", pricing: "pricing…", failed: "no price found" };
+const REPEATABLE = new Set(["shelving", "furniture"]);
+const avatar = window.appraisalAvatar;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -77,6 +79,7 @@ function appendSystem(text) {
 function render() {
   if (!state) return;
   renderLedger();
+  renderFloorPlan();
   renderNeeded();
   renderTeam();
   document.querySelector("#downloadPacket").href = sessionId ? `${API_ORIGIN}/api/sessions/${sessionId}/packet` : "#";
@@ -126,7 +129,7 @@ function renderLedger() {
       <td class="author-col">${escapeHtml(b.author) || "—"}</td>
       <td class="num">${valueCell(b)}</td></tr>`).join("");
   document.querySelector("#itemRows").innerHTML = items.map((i) => `<tr${freshClass(i.id)}>
-      <td>${escapeHtml(i.name)}<span class="sub">${escapeHtml(i.description || i.size_hint || i.category)}</span></td>
+      <td>${escapeHtml(i.name)}<span class="sub">${escapeHtml(i.description || i.size_hint || i.category)}</span>${REPEATABLE.has(i.category) && !i.quantity_confirmed ? '<span class="sub">count to confirm</span>' : ""}</td>
       <td class="num">${i.quantity}</td>
       <td class="num">${valueCell(i, i.quantity)}</td></tr>`).join("");
   document.querySelector("#bookEmpty").hidden = books.length > 0;
@@ -136,6 +139,23 @@ function renderLedger() {
   stampEl.hidden = !hasContent;
   stampEl.textContent = review.routing.replaceAll("_", " ");
   stampEl.classList.toggle("ok", review.routing === "standard_contents");
+}
+
+function renderFloorPlan() {
+  const figure = document.querySelector("#floorPlan");
+  const plan = state.floor_plan;
+  figure.hidden = !plan;
+  if (!plan) return;
+  const img = document.querySelector("#floorPlanImage");
+  if (img.dataset.version !== String(plan.version)) {
+    img.dataset.version = plan.version;
+    img.src = `${API_ORIGIN}/api/sessions/${sessionId}/floor-plan?v=${plan.version}`;
+  }
+  const r = plan.room;
+  const stale = r.floor_m2 !== state.room.floor_m2
+    ? ' <span class="stale">· measurements changed since drawn, ask for a redraw</span>' : "";
+  document.querySelector("#floorPlanCaption").innerHTML =
+    `Floor plan v${plan.version}, an illustration. Measured ${r.width_m} × ${r.depth_m} m, floor ${r.floor_m2} m²${stale}`;
 }
 
 function renderNeeded() {
@@ -148,7 +168,7 @@ function renderNeeded() {
     ["One real measurement confirmed", room.calibrated],
     ["Everything priced", entries.length > 0 && entries.every((e) => e.status === "priced" || e.status === "failed")],
   ];
-  const extras = [...review.specialist_referrals, ...review.measurement_notes].slice(0, 4);
+  const extras = [...review.specialist_referrals, ...(review.unconfirmed_counts || []), ...review.measurement_notes].slice(0, 4);
   neededListEl.innerHTML = checks.map(([label, done]) =>
     `<li class="${done ? "done" : ""}"><span class="tick-box"></span><span>${label}</span></li>`).join("")
     + extras.map((text) => `<li><span class="tick-box"></span><span>${escapeHtml(text)}</span></li>`).join("");
@@ -211,6 +231,8 @@ async function createSession(resume = true) {
   renderTranscript();
   applyServerState(payload.state);
   modelLabel.textContent = payload.has_api_key ? "Gemini 3.8 Live · ADK appraisal team" : "Add GOOGLE_API_KEY to .env to start";
+  const health = await api("/api/health").catch(() => null);
+  if (health) avatar?.configure(health.avatar);
 }
 
 function send(message) {
@@ -219,7 +241,9 @@ function send(message) {
 
 function connectLive() {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`${WS_ORIGIN}/ws/live?session_id=${encodeURIComponent(sessionId)}`);
+    const avatarMode = avatar?.supported === false ? "&avatar=off" : "";
+    avatar?.connecting();
+    const socket = new WebSocket(`${WS_ORIGIN}/ws/live?session_id=${encodeURIComponent(sessionId)}${avatarMode}`);
     liveSocket = socket;
     socket.onmessage = (event) => {
       const message = JSON.parse(event.data);
@@ -230,6 +254,7 @@ function connectLive() {
         if (cameraStream) send({ type: "camera_state", enabled: true });
         resolve();
       } else if (message.type === "session") {
+        avatar?.configure(message.avatar);
         modelLabel.textContent = `${message.model} · vision ${message.vision_model}`;
       } else if (message.type === "transcript") {
         upsertStreamingTurn(message.speaker, message.text, message.final, message.id);
@@ -240,10 +265,15 @@ function connectLive() {
         }
       } else if (message.type === "audio") {
         playPcm24(message.data);
+      } else if (message.type === "avatar_video") {
+        avatar?.append(message.data);
+      } else if (message.type === "turn_complete") {
+        avatar?.finishTurn();
       } else if (message.type === "state") {
         applyServerState(message.state);
       } else if (message.type === "interrupted") {
         stopPlayback();
+        avatar?.interrupt();
       } else if (message.type === "error") {
         appendSystem(message.message);
       }
@@ -346,6 +376,7 @@ function stopLiveVoice(closeSocket = true) {
   audioContext?.close();
   inputProcessor = micStream = audioContext = null;
   stopPlayback();
+  avatar?.reset();
   setStatus("Offline");
   setSweeping(false);
   sweepButton.disabled = true;
@@ -431,5 +462,12 @@ document.querySelector("#openPacket").addEventListener("click", () => {
   packetDialog.showModal();
 });
 document.querySelector("#closePacket").addEventListener("click", () => packetDialog.close());
+
+if (avatar) {
+  avatar.onFallback = () => {
+    stopLiveVoice();
+    setStatus("Voice mode · tap Talk to reconnect");
+  };
+}
 
 createSession().catch((error) => appendSystem(error.message));

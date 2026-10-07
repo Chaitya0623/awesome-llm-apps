@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600&family=Patrick+Hand&family=Inter:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="./styles.css?v=ledger-1" />
+    <link rel="stylesheet" href="./styles.css?v=ledger-2" />
   </head>
   <body>
     <div class="desk">
@@ -37,6 +37,16 @@
             <div class="card-head">
               <span class="card-kicker">Live call</span>
               <span id="callStatus" class="pill">Offline</span>
+            </div>
+
+            <div id="avatarStage" class="avatar-stage" data-state="idle" hidden>
+              <video id="avatarVideo" playsinline aria-label="Live AI appraisal assistant" hidden></video>
+              <span class="avatar-disclosure">AI avatar</span>
+              <div class="avatar-identity">
+                <span id="avatarName">Appraisal assistant</span>
+                <span id="avatarStatus" role="status">Start a conversation when you’re ready</span>
+              </div>
+              <button id="resumeAvatar" class="avatar-resume" type="button" hidden>Play voice and video</button>
             </div>
 
             <div id="cameraStage" class="camera-stage" hidden>
@@ -91,6 +101,10 @@
               <div class="total"><span class="label">Floor area</span><span id="floorArea" class="figure">—</span><span id="floorSub" class="sub">needs a wide room pass</span></div>
             </div>
             <p id="roomLine" class="room-line"></p>
+            <figure id="floorPlan" class="floor-plan" hidden>
+              <img id="floorPlanImage" alt="Hand-drawn floor plan of the library" />
+              <figcaption id="floorPlanCaption"></figcaption>
+            </figure>
             <div id="stamp" class="stamp" hidden></div>
 
             <h2 class="ledger-title">Books <span id="bookTally" class="tally"></span></h2>
@@ -142,6 +156,7 @@
     </dialog>
 
     <canvas id="frameCanvas" hidden></canvas>
-    <script src="./app.js?v=ledger-1"></script>
+    <script src="./avatar.js?v=1"></script>
+    <script src="./app.js?v=ledger-2"></script>
   </body>
 </html>

@@ -10,12 +10,12 @@ from datetime import datetime
 from typing import Any
 
 try:
-    from .inventory import InventoryStore
+    from .inventory import InventoryStore, clean_item_readings
     from .schemas import (
         AppraisalPacket, AppraisalRequest, Locale, PriceEstimate, RoomView, UnderwritingReview,
     )
 except ImportError:
-    from inventory import InventoryStore
+    from inventory import InventoryStore, clean_item_readings
     from schemas import (
         AppraisalPacket, AppraisalRequest, Locale, PriceEstimate, RoomView, UnderwritingReview,
     )
@@ -26,6 +26,7 @@ LOW_CONFIDENCE_READ = 0.6
 SCHEDULE_SHARE = 0.10  # one line worth >=10% of the contents total gets listed for a scheduled rider
 MIN_ROOM_SAMPLES = 3
 UNPRICED_SHARE_LIMIT = 0.25
+REPEATABLE_CATEGORIES = {"shelving", "furniture"}  # often several identical pieces in one room
 _FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 _NOT_SPECIFIED = {"", "not specified", "unknown"}
 
@@ -41,8 +42,9 @@ def inventory_from_request(request: dict[str, Any]) -> dict[str, Any]:
     store = InventoryStore(Locale(city=city, country=country, currency=currency))
     for spine in req.books:
         store.add_spine(spine, "typed")
-    for item in req.items:
-        store.add_item(item, "typed")
+    for item in clean_item_readings(req.items):
+        # The claimant stated the quantity themselves, so it is not a camera minimum.
+        store.add_item(item, "typed").quantity_confirmed = True
     if req.room.visible or req.room.width_m:
         store.add_room_view(RoomView.model_validate({**req.room.model_dump(), "visible": True}))
     if req.room_dimensions_stated:
@@ -173,9 +175,9 @@ def underwriting_review(inventory: dict[str, Any], room: dict[str, Any]) -> dict
 
     specialist = [f"{b['title']} ({b.get('author') or 'unknown author'}): possible collectible edition"
                   for b in books if (b.get("price") or {}).get("collectible")]
-    specialist += [f"{i['name']}: original art needs an independent appraisal"
-                   for i in items if i.get("category") == "art" and "print" not in (i.get("description") or "").lower()
-                   and i.get("price")]
+    # The valuer flags original art, antiques, and provenance-driven pieces; prints and posters are not.
+    specialist += [f"{i['name']}: original art or antique needs an independent appraisal"
+                   for i in items if (i.get("price") or {}).get("collectible")]
     schedule = [
         f"{e.get('title') or e.get('name')}: {_line_value(e):,.0f} {(e.get('price') or {}).get('currency', '')}"
         for e in [*books, *items]
@@ -184,6 +186,8 @@ def underwriting_review(inventory: dict[str, Any], room: dict[str, Any]) -> dict
     low_reads = [f"{b['title']} (read confidence {b.get('confidence', 0):.0%})"
                  for b in books if b.get("confidence", 1) < LOW_CONFIDENCE_READ]
     unpriced = [e.get("title") or e.get("name") for e in [*books, *items] if e.get("status") != "priced"]
+    unconfirmed = [f"{i['name']}: {i.get('quantity', 1)} seen on camera, total not confirmed"
+                   for i in items if i.get("category") in REPEATABLE_CATEGORIES and not i.get("quantity_confirmed")]
 
     notes = []
     if room.get("samples", 0) == 0:
@@ -208,7 +212,7 @@ def underwriting_review(inventory: dict[str, Any], room: dict[str, Any]) -> dict
     return UnderwritingReview(
         routing=routing, routing_reason=reason, specialist_referrals=specialist,
         schedule_separately=schedule, low_confidence_reads=low_reads, unpriced=unpriced,
-        measurement_notes=notes,
+        unconfirmed_counts=unconfirmed, measurement_notes=notes,
     ).model_dump()
 
 
@@ -254,6 +258,7 @@ def build_appraisal_packet(inventory: dict[str, Any], room: dict[str, Any], revi
         ("Consider scheduling separately", review["schedule_separately"]),
         ("Low-confidence spine reads", review["low_confidence_reads"]),
         ("Not yet priced", review["unpriced"]),
+        ("Counts to confirm with the claimant", review.get("unconfirmed_counts", [])),
         ("Measurement notes", review["measurement_notes"]),
         ("Claimant notes", [f"{n['note']} (evidence/{n['frame']}.jpg)" for n in inventory.get("notes", [])]),
     ]

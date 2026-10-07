@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import tests.offline  # noqa: F401,E402  (before any app import)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 from PIL import Image
 from agent import run_appraisal_workflow
@@ -34,9 +35,15 @@ class FakeGenai:
     def __init__(self, scans):
         self.scans = list(scans)
         self.calls = []
+        self.prompts = []
         self.aio = NS(models=NS(generate_content=self.generate))
 
     async def generate(self, model, contents, config=None):
+        if config is not None and config.response_modalities == ["IMAGE"]:
+            self.calls.append("sketch")
+            self.prompts.append(contents)
+            part = NS(inline_data=NS(data=b"\x89PNGplan", mime_type="image/png"))
+            return NS(candidates=[NS(content=NS(parts=[part]))])
         if isinstance(contents, str):
             self.calls.append("currency")
             return NS(text="INR", parsed=None)
@@ -51,7 +58,8 @@ class FakeGenai:
 class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.genai = FakeGenai([SHELF, ROOM])
-        self.fake_llm = FakeGemini(calls=[])
+        # I0004 is the framed oil portrait from the ROOM frame; the valuer flags it as original art.
+        self.fake_llm = FakeGemini(calls=[], collectible_ids=("I0004",))
         patches = [
             patch.object(s, "_client", lambda: self.genai),
             patch.object(s, "_has_api_key", lambda: True),
@@ -107,6 +115,26 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.store.pending_count(), 0)
         self.assertEqual(self.fake_llm.calls, ["books", "items"])
 
+    async def test_entries_scanned_during_a_pricing_run_are_priced_next(self):
+        session = self.session
+        real = s.run_appraisal_workflow
+        calls = []
+
+        async def run_while_scanning(inventory, **kwargs):
+            calls.append(len(inventory["items"]))
+            if len(calls) == 1:  # a frame lands while the first batch is being priced
+                session.store.add_item(ItemReading(category="lighting", name="brass floor lamp"), "F9")
+            return await real(inventory, **kwargs)
+
+        await s.set_pricing_location(session, "Mumbai", "India", "INR")
+        with patch.object(s, "run_appraisal_workflow", run_while_scanning):
+            await s._scan_frame(session, "F1", jpeg("white"))
+            await session.valuation_task
+        self.assertEqual(calls, [1, 2])
+        self.assertEqual(session.store.pending_count(), 0)
+        lamp = next(i for i in session.store.items.values() if i.name == "brass floor lamp")
+        self.assertEqual(lamp.status, "priced")
+
     async def test_failed_graph_run_marks_batch_failed_and_sync_retries(self):
         await s.set_pricing_location(self.session, "Mumbai", "India", "INR")
         with patch.object(s, "run_appraisal_workflow", side_effect=RuntimeError("quota")):
@@ -127,6 +155,35 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.03)
         self.assertEqual(self.genai.calls.count("scan"), 1)
         self.assertEqual(self.session.store.frames_scanned, 1)
+
+    async def test_floor_plan_needs_a_measured_room_then_reuses_and_redraws(self):
+        session = self.session
+        args = {"layout_description": "Bookcase along the north wall, portrait by the door", "trigger": "automatic"}
+        self.assertFalse((await s.draw_floor_plan(session, args))["sketched"])
+        self.assertFalse((await s.draw_floor_plan(session, {**args, "trigger": "correction"}))["sketched"])
+        await s._scan_frame(session, "F1", jpeg("white"))
+        await s._scan_frame(session, "F2", jpeg("black"))
+
+        drawn = await s.draw_floor_plan(session, args)
+        self.assertTrue(drawn["sketched"])
+        self.assertIn("4.0 m by 5.0 m", self.genai.prompts[0])
+        self.assertIn("Floor 20.0 m²", self.genai.prompts[0])
+        self.assertIn("teak bookcase", self.genai.prompts[0])
+        self.assertEqual(session.floor_plan_image, b"\x89PNGplan")
+        self.assertNotIn("floor_plan_image", s._ui_state(session)["floor_plan"])  # served over HTTP, not pushed
+
+        self.assertTrue((await s.draw_floor_plan(session, args))["reused"])
+        corrected = await s.draw_floor_plan(session, {"layout_description": "Bookcase on the east wall", "trigger": "correction"})
+        self.assertEqual(corrected["version"], 2)
+        self.assertEqual(self.genai.calls.count("sketch"), 2)
+
+    async def test_claimant_count_replaces_the_camera_count(self):
+        await s._scan_frame(self.session, "F1", jpeg("white"))
+        result = await s.set_item_count(self.session, "teak bookcases", 4)
+        self.assertEqual((result["updated"], result["quantity"]), (True, 4))
+        missing = await s.set_item_count(self.session, "grand piano", 1)
+        self.assertFalse(missing["updated"])
+        self.assertIn("teak bookcase", missing["known_items"])
 
 
 if __name__ == "__main__":

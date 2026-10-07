@@ -34,7 +34,7 @@ class FakeGemini(BaseLlm):
         elif "book valuation specialist" in instruction:
             role, text = "books", quote_all(instruction, collectible_ids=self.collectible_ids)
         elif "contents valuation specialist" in instruction:
-            role, text = "items", quote_all(instruction, 1000, 1500, 2500)
+            role, text = "items", quote_all(instruction, 1000, 1500, 2500, collectible_ids=self.collectible_ids)
         else:
             role, text = "other", ""
         self.calls.append(role)

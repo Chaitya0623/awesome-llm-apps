@@ -65,6 +65,20 @@ input { background: rgba(255,255,255,0.06); color: var(--chrome-ink); border: 1p
 .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: #ff4d3d; animation: blink 1s infinite; }
 @keyframes blink { 50% { opacity: .25; } }
 
+/* Live avatar: the agent's face. Separate from the claimant's camera and never evidence. */
+.avatar-stage { position: relative; height: 300px; overflow: hidden; margin-bottom: 12px; border: 1px solid var(--card-line); border-radius: 10px; background: var(--desk); }
+#avatarVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 35%; }
+.avatar-disclosure { position: absolute; top: 10px; left: 10px; padding: 3px 9px; border: 1px solid var(--card-line); border-radius: 999px; background: var(--card); color: var(--chrome-body); font-size: 11px; font-weight: 500; }
+.avatar-identity { position: absolute; right: 10px; bottom: 10px; left: 10px; display: flex; flex-direction: column; gap: 3px; padding: 8px 12px; border: 1px solid var(--card-line); border-radius: 8px; background: var(--card); }
+#avatarName { font-size: 13px; font-weight: 600; }
+#avatarStatus { font-size: 11px; color: var(--chrome-body); }
+.avatar-stage[data-state="error"] #avatarStatus { color: var(--danger); }
+.avatar-resume { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-width: calc(100% - 24px); padding: 9px 16px; border: 1px solid var(--card-line); border-radius: 999px; background: var(--card); color: var(--chrome-ink); font-size: 13px; font-weight: 500; cursor: pointer; }
+.avatar-resume:hover { background: var(--desk); }
+.avatar-stage [hidden] { display: none; }
+/* With a face on screen, the shelf camera shares the column in landscape. */
+.call-card:has(.avatar-stage:not([hidden])) .camera-stage { aspect-ratio: 4 / 3; }
+
 .controls { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
 .round-button { display: flex; flex-direction: column; align-items: center; gap: 6px; background: none; border: 0; color: var(--chrome-body); cursor: pointer; padding: 4px 0; }
 .round-button:disabled { opacity: .4; cursor: default; }
@@ -116,6 +130,10 @@ input { background: rgba(255,255,255,0.06); color: var(--chrome-ink); border: 1p
 .total.main .figure { color: var(--ink-green); font-size: 42px; }
 .total .sub { font-family: var(--hand-label); font-size: 14px; color: var(--ink-soft); }
 .room-line { font-family: var(--hand); font-size: 21px; margin: 6px 0 4px; color: var(--ink); }
+.floor-plan { margin: 10px 0 4px; max-width: 460px; background: #fff; padding: 8px 8px 4px; box-shadow: 0 2px 8px rgba(0,0,0,.18); transform: rotate(-.8deg); }
+.floor-plan img { display: block; width: 100%; height: auto; }
+.floor-plan figcaption { font-family: var(--hand-label); font-size: 14px; color: var(--ink-soft); padding: 4px 2px 0; }
+.floor-plan .stale { color: var(--ink-red); }
 .ledger-title { font-family: var(--hand-label); font-weight: 400; font-size: 22px; margin: 18px 0 2px; color: var(--ink-red); }
 .tally { font-size: 16px; color: var(--ink-soft); }
 .ledger { width: 100%; border-collapse: collapse; font-family: var(--hand); font-size: 21px; }
@@ -158,6 +176,7 @@ input { background: rgba(255,255,255,0.06); color: var(--chrome-ink); border: 1p
   .ledger .author-inline { display: block; }
   .conversation-column { display: flex; }
   .camera-stage { aspect-ratio: 4 / 3; }
+  .avatar-stage { height: 240px; }
   .notebook { padding: 20px 14px 32px 40px; background-image: linear-gradient(90deg, transparent 28px, var(--paper-margin) 28px, var(--paper-margin) 30px, transparent 30px), repeating-linear-gradient(transparent 0 31px, var(--paper-line) 31px 32px); }
   .holes { display: none; }
   .totals { grid-template-columns: 1fr 1fr; }

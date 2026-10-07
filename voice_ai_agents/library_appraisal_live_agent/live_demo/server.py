@@ -56,9 +56,9 @@ def _cors_origins() -> list[str]:
 
 _load_dotenv()
 
-from agent import MODEL, run_appraisal_workflow  # noqa: E402
+from agent import MODEL, OPENAI_PRICING_MODEL, PRICING_PROVIDER, run_appraisal_workflow  # noqa: E402
 from appraisal_rules import books_csv, inventory_totals, items_csv, underwriting_review  # noqa: E402
-from inventory import InventoryStore  # noqa: E402
+from inventory import InventoryStore, clean_item_readings  # noqa: E402
 from room_measurement import calibration_factor, known_sizes_prompt  # noqa: E402
 from schemas import FrameScan, Locale  # noqa: E402
 
@@ -67,10 +67,16 @@ if str(DEMO_DIR) not in sys.path:
 
 from live_tools import (  # noqa: E402
     LIVE_MODEL_ID,
+    OPENAI_SKETCH_MODEL,
+    OPENAI_VISION_MODEL,
+    SKETCH_MODEL_ID,
+    SKETCH_PROVIDER,
     TOOL_NAMES,
     VISION_MODEL_ID,
+    VISION_PROVIDER,
     build_live_config,
     camera_mode_instruction,
+    floor_plan_prompt,
     frame_scan_prompt,
     object_size_prompt,
     scheduling_for,
@@ -79,6 +85,8 @@ from live_tools import (  # noqa: E402
 )
 
 GENAI_CLIENT = None
+AVATAR_CLIENT = None
+OPENAI_CLIENT = None
 logger = logging.getLogger(__name__)
 FRAME_MAX_AGE_SECONDS = 12.0
 SWEEP_INTERVAL_SECONDS = 1.5
@@ -86,6 +94,50 @@ SIMILAR_FRAME_THRESHOLD = 6.0  # mean abs pixel difference (0-255) on a 32x24 th
 MAX_EVIDENCE_FRAMES = 200
 MAX_VALUATION_RUNS = 25
 SYNC_TIMEOUT_SECONDS = 90
+SKETCH_TIMEOUT_SECONDS = 120  # image models take 30-60 s for a labelled plan
+
+
+def avatar_settings() -> dict[str, str]:
+    """Keep the optional Cloud avatar transport separate from appraisal model auth."""
+    return {
+        "name": os.getenv("APPRAISAL_AVATAR_NAME", "").strip(),
+        "project": os.getenv("APPRAISAL_AVATAR_PROJECT", "").strip(),
+        "location": os.getenv("APPRAISAL_AVATAR_LOCATION", "us-central1").strip(),
+        "image": os.getenv("APPRAISAL_AVATAR_IMAGE", "").strip(),
+        "voice": os.getenv("APPRAISAL_AVATAR_VOICE", "Kore").strip(),
+    }
+
+
+def avatar_description(enabled: bool | None = None) -> dict[str, Any]:
+    settings = avatar_settings()
+    configured = bool(settings["project"] and (settings["name"] or settings["image"]))
+    return {
+        "enabled": configured if enabled is None else enabled,
+        "name": "Appraiser" if settings["image"] else settings["name"],
+    }
+
+
+def avatar_reference() -> bytes:
+    path = (APP_DIR / avatar_settings()["image"]).resolve()
+    data = path.read_bytes()
+    if len(data) >= 5 * 1024 * 1024 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError("Custom avatar must be a PNG under 5 MB")
+    width, height = int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if width < 704 or height < 1280:
+        raise ValueError("Custom avatar must be at least 704 x 1280")
+    return data
+
+
+def live_media_message(blob):
+    """Never interpret the avatar's muxed video/voice bytes as raw PCM."""
+    mime = blob.mime_type or ""
+    if not isinstance(blob.data, bytes) or not mime.startswith(("video/mp4", "audio/pcm")):
+        return None
+    return {
+        "type": "avatar_video" if mime.startswith("video/") else "audio",
+        "data": base64.b64encode(blob.data).decode("ascii"),
+        "mime_type": mime,
+    }
 
 
 class SessionResponse(BaseModel):
@@ -104,6 +156,9 @@ class AppraisalSession:
     evidence_frames: OrderedDict = field(default_factory=OrderedDict)
     last_workflow: dict[str, Any] | None = None
     last_workflow_key: int | None = None
+    floor_plan: dict[str, Any] | None = None  # metadata only; the PNG is served over HTTP
+    floor_plan_image: bytes = b""
+    floor_plan_revision: int = 0
     last_frame: bytes | None = None
     last_frame_at: float = 0.0
     last_frame_id: str = ""
@@ -163,6 +218,19 @@ def _client():
     return GENAI_CLIENT
 
 
+def _live_client(avatar_enabled: bool = False):
+    if not avatar_enabled:
+        return _client()
+    global AVATAR_CLIENT
+    if AVATAR_CLIENT is None:
+        from google import genai
+        settings = avatar_settings()
+        AVATAR_CLIENT = genai.Client(
+            vertexai=True, project=settings["project"], location=settings["location"],
+        )
+    return AVATAR_CLIENT
+
+
 def _track(session: AppraisalSession, task: asyncio.Task) -> asyncio.Task:
     session.tasks.add(task)
 
@@ -205,6 +273,7 @@ def _ui_state(session: AppraisalSession) -> dict[str, Any]:
         "camera_enabled": session.camera_enabled,
         "packet_ready": session.last_workflow is not None,
         "packet_markdown": (session.last_workflow or {}).get("final_markdown", ""),
+        "floor_plan": session.floor_plan,
         "tool_activity": session.tool_activity[-12:],
     }
 
@@ -222,10 +291,95 @@ def _frame_distance(a: bytes, b: bytes) -> float:
     return sum(abs(x - y) for x, y in zip(a, b)) / max(1, len(a))
 
 
-async def _scan_frame(session: AppraisalSession, frame_id: str, jpeg: bytes, *, force: bool = False) -> dict[str, Any]:
-    """Read one frame with the vision model and merge spines, items, and room view into the inventory."""
+# ------------------------------------------------------------------ model providers
+
+def _openai():
+    global OPENAI_CLIENT
+    if OPENAI_CLIENT is None:
+        from openai import AsyncOpenAI
+
+        OPENAI_CLIENT = AsyncOpenAI()
+    return OPENAI_CLIENT
+
+
+def _openai_content(prompt: str, jpeg: bytes | None) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    if jpeg:
+        # Spine text is small; high detail keeps it legible.
+        content.append({"type": "input_image", "detail": "high",
+                        "image_url": "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")})
+    return [{"role": "user", "content": [*content, {"type": "input_text", "text": prompt}]}]
+
+
+def vision_model_label() -> str:
+    return f"openai:{OPENAI_VISION_MODEL}" if VISION_PROVIDER == "openai" else VISION_MODEL_ID
+
+
+def sketch_model_label() -> str:
+    return f"openai:{OPENAI_SKETCH_MODEL}" if SKETCH_PROVIDER == "openai" else SKETCH_MODEL_ID
+
+
+async def _read_frame(jpeg: bytes) -> FrameScan:
+    """One structured reading of spines, items, and room dimensions from a camera frame."""
+    prompt = frame_scan_prompt(known_sizes_prompt())
+    if VISION_PROVIDER == "openai":
+        response = await _openai().responses.parse(
+            model=OPENAI_VISION_MODEL, input=_openai_content(prompt, jpeg), text_format=FrameScan,
+        )
+        return response.output_parsed or FrameScan()
     from google.genai import types
 
+    response = await _client().aio.models.generate_content(
+        model=VISION_MODEL_ID,
+        contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=FrameScan,
+            temperature=0.2,
+        ),
+    )
+    return response.parsed if isinstance(response.parsed, FrameScan) else FrameScan.model_validate_json(response.text or "{}")
+
+
+async def _ask(prompt: str, jpeg: bytes | None = None) -> str:
+    """A short plain-text answer, optionally about an image (currency codes, object sizes)."""
+    if VISION_PROVIDER == "openai":
+        response = await _openai().responses.create(model=OPENAI_VISION_MODEL, input=_openai_content(prompt, jpeg))
+        return response.output_text or ""
+    from google.genai import types
+
+    contents = [types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), prompt] if jpeg else prompt
+    response = await _client().aio.models.generate_content(model=VISION_MODEL_ID, contents=contents)
+    return response.text or ""
+
+
+async def _draw(prompt: str) -> tuple[bytes, str] | None:
+    """Generate one image; returns (bytes, mime type), or None when the model returned no image."""
+    if SKETCH_PROVIDER == "openai":
+        response = await _openai().images.generate(
+            model=OPENAI_SKETCH_MODEL, prompt=prompt, size="1024x1024", quality="medium",
+        )
+        data = response.data[0].b64_json if response.data else None
+        return (base64.b64decode(data), "image/png") if data else None
+    from google.genai import types
+
+    response = await _client().aio.models.generate_content(
+        model=SKETCH_MODEL_ID, contents=prompt, config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+    )
+    part = next(
+        (
+            part
+            for candidate in response.candidates or []
+            for part in (candidate.content.parts if candidate.content else [])
+            if part.inline_data and part.inline_data.data
+        ),
+        None,
+    )
+    return (part.inline_data.data, part.inline_data.mime_type or "image/png") if part else None
+
+
+async def _scan_frame(session: AppraisalSession, frame_id: str, jpeg: bytes, *, force: bool = False) -> dict[str, Any]:
+    """Read one frame with the vision model and merge spines, items, and room view into the inventory."""
     async with session.scan_lock:
         thumb = _thumbnail(jpeg)
         if not force and session.last_scanned_thumb is not None and (
@@ -234,22 +388,13 @@ async def _scan_frame(session: AppraisalSession, frame_id: str, jpeg: bytes, *, 
             session.last_scanned_id = frame_id
             return {"skipped": True}
         session.last_scanned_id, session.last_scanned_thumb = frame_id, thumb
-        response = await _client().aio.models.generate_content(
-            model=VISION_MODEL_ID,
-            contents=[types.Part.from_bytes(data=jpeg, mime_type="image/jpeg"), frame_scan_prompt(known_sizes_prompt())],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=FrameScan,
-                temperature=0.2,
-            ),
-        )
-    scan = response.parsed if isinstance(response.parsed, FrameScan) else FrameScan.model_validate_json(response.text or "{}")
+        scan = await _read_frame(jpeg)
 
     store = session.store
     books_before, items_before = len(store.books), len(store.items)
     for spine in scan.spines:
         store.add_spine(spine, frame_id)
-    for item in scan.items:
+    for item in clean_item_readings(scan.items):
         store.add_item(item, frame_id)
     store.add_room_view(scan.room)
     store.frames_scanned += 1
@@ -289,11 +434,8 @@ def set_sweeping(session: AppraisalSession, enabled: bool) -> None:
 
 
 async def _resolve_currency(city: str, country: str) -> str:
-    response = await _client().aio.models.generate_content(
-        model=VISION_MODEL_ID,
-        contents=f"ISO 4217 currency code used in {city}, {country}? Reply with only the 3-letter code.",
-    )
-    code = (response.text or "").strip().upper()[:3]
+    answer = await _ask(f"ISO 4217 currency code used in {city}, {country}? Reply with only the 3-letter code.")
+    code = answer.strip().upper()[:3]
     return code if len(code) == 3 and code.isalpha() else "USD"
 
 
@@ -307,19 +449,11 @@ async def set_pricing_location(session: AppraisalSession, city: str, country: st
 
 
 async def calibrate_room_scale(session: AppraisalSession, object_name: str, dimension: str, real_size_m: float) -> dict[str, Any]:
-    from google.genai import types
-
     if not session.last_frame or time.monotonic() - session.last_frame_at > FRAME_MAX_AGE_SECONDS:
         return {"calibrated": False, "message": "No recent camera frame. Ask the claimant to show the object."}
-    response = await _client().aio.models.generate_content(
-        model=VISION_MODEL_ID,
-        contents=[
-            types.Part.from_bytes(data=session.last_frame, mime_type="image/jpeg"),
-            object_size_prompt(object_name, dimension, known_sizes_prompt()),
-        ],
-    )
+    answer = await _ask(object_size_prompt(object_name, dimension, known_sizes_prompt()), session.last_frame)
     try:
-        estimated = float((response.text or "").strip().split()[0].rstrip("m"))
+        estimated = float(answer.strip().split()[0].rstrip("m"))
     except (ValueError, IndexError):
         estimated = 0.0
     if estimated <= 0 or real_size_m <= 0:
@@ -329,6 +463,66 @@ async def calibrate_room_scale(session: AppraisalSession, object_name: str, dime
     session.store.set_calibration(calibration_factor(estimated, real_size_m), note)
     await _notify(session)
     return {"calibrated": True, "note": note, "room": session.store.room().model_dump()}
+
+
+async def set_item_count(session: AppraisalSession, item_name: str, quantity: int) -> dict[str, Any]:
+    item = session.store.set_item_count(item_name, quantity)
+    if item is None:
+        return {
+            "updated": False,
+            "message": f"No item like '{item_name}' on the ledger yet. Show it on camera, or use one of these names.",
+            "known_items": [i.name for i in session.store.items.values()][:20],
+        }
+    # Prices are per unit and totals multiply by quantity, so nothing needs re-pricing.
+    await _notify(session)
+    return {"updated": True, "item": item.name, "quantity": item.quantity}
+
+
+def _room_labels(room: dict[str, Any]) -> dict[str, Any]:
+    return {key: room[key] for key in ("width_m", "depth_m", "ceiling_m", "floor_m2", "wall_m2", "calibrated")}
+
+
+async def draw_floor_plan(session: AppraisalSession, args: dict[str, Any]) -> dict[str, Any]:
+    """Sketch a top-down plan with the image model, labelled with the deterministic measurements."""
+
+    layout = str(args.get("layout_description", "")).strip()[:2000]
+    trigger = args.get("trigger", "automatic")
+    if not layout:
+        return {"sketched": False, "message": "Describe where the bookcases and other contents stand."}
+    if trigger not in {"automatic", "explicit_request", "correction"}:
+        return {"sketched": False, "message": "Unknown floor plan trigger."}
+    if trigger == "correction" and not session.floor_plan:
+        return {"sketched": False, "message": "There is no floor plan to correct yet."}
+    room = session.store.room().model_dump()
+    if not room["floor_m2"]:
+        return {"sketched": False, "message": "The room is not measured yet. Ask for a slow wide pass of every wall first."}
+    labels = _room_labels(room)
+    current = session.floor_plan
+    if current and current["layout"].casefold() == layout.casefold() and current["room"] == labels:
+        return {"sketched": True, "reused": True, "version": current["version"], "message": "The current plan already shows this layout."}
+    session.floor_plan_revision += 1
+    request_revision = session.floor_plan_revision
+    image = await asyncio.wait_for(
+        _draw(floor_plan_prompt(layout, room, session.store.to_state()["items"])), SKETCH_TIMEOUT_SECONDS,
+    )
+    if image is None:
+        return {"sketched": False, "message": "The sketch model returned no image. Continue without it."}
+    if session.deleted or request_revision != session.floor_plan_revision:
+        return {"sketched": False, "message": "Superseded by a newer floor plan request."}
+    session.floor_plan_image, mime_type = image
+    session.floor_plan = {
+        "version": request_revision,
+        "mime_type": mime_type,
+        "layout": layout,
+        "trigger": trigger,
+        "room": labels,
+    }
+    await _notify(session)
+    return {
+        "sketched": True,
+        "version": request_revision,
+        "next_step": "Say the plan is an illustration with the measured sizes and ask if the layout looks right.",
+    }
 
 
 # ------------------------------------------------------------------ ADK appraisal graph
@@ -349,7 +543,9 @@ async def _run_workflow_cached(session: AppraisalSession) -> dict[str, Any]:
             raise
         session.store.apply_valuations(workflow["valuations"])
         session.last_workflow = workflow
-        session.last_workflow_key = session.store.revision
+        # Entries scanned while this run was pricing are still pending: leave the cache stale so the
+        # valuation loop runs again for them instead of returning this result forever.
+        session.last_workflow_key = None if session.store.pending_count() else session.store.revision
         return workflow
 
 
@@ -393,8 +589,11 @@ def health() -> dict[str, Any]:
         "model": MODEL,
         "has_api_key": _has_api_key(),
         "live_model": LIVE_MODEL_ID,
-        "vision_model": VISION_MODEL_ID,
+        "vision_model": vision_model_label(),
+        "sketch_model": sketch_model_label(),
+        "pricing": f"openai:{OPENAI_PRICING_MODEL}" if PRICING_PROVIDER == "openai" else f"gemini:{MODEL}",
         "tools": TOOL_NAMES,
+        "avatar": avatar_description(),
     }
 
 
@@ -493,6 +692,8 @@ def download_packet(session_id: str, request: Request):
     workflow = session.last_workflow or {}
     room = session.store.room().model_dump()
     markdown = workflow.get("final_markdown") or "# Library Contents Appraisal\n\nRun sync_appraisal_packet to build the full packet."
+    if session.floor_plan:
+        markdown += f"\n\n## Floor plan\n\n- [Floor plan v{session.floor_plan['version']}](floor_plan.png): illustration of the layout, not a survey drawing. Measurements above are authoritative.\n"
     used = {f for e in [*inventory["books"], *inventory["items"]] for f in e["frame_ids"]}
     used |= {note["frame"] for note in inventory["notes"]}
     buffer = io.BytesIO()
@@ -503,6 +704,8 @@ def download_packet(session_id: str, request: Request):
         archive.writestr("room.json", json.dumps(room, indent=2))
         archive.writestr("underwriting.json", json.dumps(underwriting_review(inventory, room), indent=2))
         archive.writestr("inventory.json", json.dumps(inventory, indent=2))
+        if session.floor_plan:
+            archive.writestr("floor_plan.png", session.floor_plan_image)
         for frame_id in sorted(used & set(session.evidence_frames)):
             archive.writestr(f"evidence/{frame_id}.jpg", session.evidence_frames[frame_id])
     return Response(
@@ -510,6 +713,14 @@ def download_packet(session_id: str, request: Request):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="library-appraisal-{session_id[:8]}.zip"'},
     )
+
+
+@app.get("/api/sessions/{session_id}/floor-plan")
+def floor_plan_image(session_id: str, request: Request):
+    session = owned_session(session_id, request.cookies.get("appraisal_owner"))
+    if not session.floor_plan:
+        raise HTTPException(status_code=404, detail="No floor plan yet")
+    return Response(session.floor_plan_image, media_type=session.floor_plan["mime_type"], headers={"Cache-Control": "no-store"})
 
 
 def set_camera_mode(session: AppraisalSession, enabled: bool) -> bool:
@@ -620,6 +831,10 @@ async def live_voice(websocket: WebSocket) -> None:
                     result = {"pinned": True, **await _scan_frame(session, frame_id, frame, force=True)}
             elif name == "calibrate_room_scale":
                 result = await calibrate_room_scale(session, str(args.get("object_name", "object")), str(args.get("dimension", "height")), float(args.get("real_size_m") or 0))
+            elif name == "set_item_count":
+                result = await set_item_count(session, str(args.get("item_name", "")), int(args.get("quantity") or 0))
+            elif name == "draw_floor_plan":
+                result = await draw_floor_plan(session, args)
             elif name == "sync_appraisal_packet":
                 await finalize("Claimant")
                 result = await sync_appraisal_packet(session)
@@ -662,12 +877,21 @@ async def live_voice(websocket: WebSocket) -> None:
             for turn in session.transcript
             if turn["speaker"] in {"Claimant", "Agent"}
         ]
-        config = build_live_config(camera_enabled=session.camera_enabled, seed_history=bool(history))
-        async with _client().aio.live.connect(model=LIVE_MODEL_ID, config=config) as live_session:
+        settings = avatar_settings()
+        avatar_enabled = avatar_description()["enabled"] and websocket.query_params.get("avatar") != "off"
+        avatar_image = avatar_reference() if avatar_enabled and settings["image"] else None
+        config = build_live_config(
+            camera_enabled=session.camera_enabled,
+            avatar_name=settings["name"] if avatar_enabled else "",
+            avatar_image=avatar_image,
+            avatar_voice=settings["voice"] if avatar_enabled else None,
+            seed_history=bool(history),
+        )
+        async with _live_client(avatar_enabled).aio.live.connect(model=LIVE_MODEL_ID, config=config) as live_session:
             if history:
                 # Restore dialogue as context before accepting another turn on reconnect.
                 await live_session.send_client_content(turns=history, turn_complete=True)
-            await send({"type": "session", "model": LIVE_MODEL_ID, "vision_model": VISION_MODEL_ID, "tools": TOOL_NAMES})
+            await send({"type": "session", "model": LIVE_MODEL_ID, "vision_model": vision_model_label(), "tools": TOOL_NAMES, "avatar": avatar_description(avatar_enabled)})
             await push_state()
             await send({"type": "ready"})
             if not history:
@@ -773,7 +997,7 @@ async def live_voice(websocket: WebSocket) -> None:
                         content = response.server_content
                         if not content:
                             continue
-                        # Clear queued voice before forwarding any more content.
+                        # Clear queued voice/video before forwarding any more content.
                         if content.interrupted:
                             await send({"type": "interrupted"})
                             await finalize("Agent")
@@ -789,10 +1013,13 @@ async def live_voice(websocket: WebSocket) -> None:
                                 await finalize(speaker)
                         if content.model_turn and not content.interrupted:
                             for part in content.model_turn.parts or []:
-                                blob = part.inline_data
-                                if blob and isinstance(blob.data, bytes) and (blob.mime_type or "").startswith("audio/pcm"):
-                                    await finalize("Claimant")
-                                    await send({"type": "audio", "data": base64.b64encode(blob.data).decode("ascii"), "mime_type": blob.mime_type})
+                                media = live_media_message(part.inline_data) if part.inline_data else None
+                                if media:
+                                    # Avatar video also streams while listening;
+                                    # idle frames must not split the claimant's turn.
+                                    if media["type"] == "audio":
+                                        await finalize("Claimant")
+                                    await send(media)
                         if getattr(content, "turn_complete", False):
                             await finalize("Claimant")
                             await finalize("Agent")
@@ -839,6 +1066,11 @@ def index_alias():
 @app.get("/app.js")
 def javascript():
     return FileResponse(DEMO_DIR / "app.js", media_type="text/javascript")
+
+
+@app.get("/avatar.js")
+def avatar_javascript():
+    return FileResponse(DEMO_DIR / "avatar.js", media_type="text/javascript")
 
 
 @app.get("/styles.css")

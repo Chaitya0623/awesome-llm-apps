@@ -95,6 +95,9 @@ class NonBookItem(BaseModel):
     quantity: int = 1
     condition: str = "good"
     size_hint: str = ""
+    # The camera cannot tell identical objects apart across frames, so quantity is the most seen in
+    # one frame until the claimant confirms the real count.
+    quantity_confirmed: bool = False
     frame_ids: list[str] = Field(default_factory=list)
     price: PriceEstimate | None = None
     status: EntryStatus = "pending"
@@ -137,6 +140,7 @@ class UnderwritingReview(BaseModel):
     schedule_separately: list[str] = Field(default_factory=list)
     low_confidence_reads: list[str] = Field(default_factory=list)
     unpriced: list[str] = Field(default_factory=list)
+    unconfirmed_counts: list[str] = Field(default_factory=list)
     measurement_notes: list[str] = Field(default_factory=list)
 
 

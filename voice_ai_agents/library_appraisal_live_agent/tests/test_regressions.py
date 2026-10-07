@@ -2,6 +2,7 @@
 import io, json, sys, unittest, uuid, zipfile
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import tests.offline  # noqa: F401,E402  (before any app import)
 import appraisal_rules as r
 from inventory import InventoryStore
 from room_measurement import CALIBRATED_RANGE, UNCALIBRATED_RANGE, calibration_factor, estimate_room
@@ -65,6 +66,41 @@ class InventoryTests(unittest.TestCase):
         store.add_item(ItemReading(category="decor", name="ceramic mug", quantity=6), "F2")
         (item,) = store.items.values()
         self.assertEqual(item.quantity, 6)
+
+    def test_identical_furniture_in_separate_frames_needs_a_confirmed_count(self):
+        store = InventoryStore()
+        for frame in ("F1", "F2", "F3", "F4"):
+            store.add_item(ItemReading(category="shelving", name="oak bookcase"), frame)
+        (item,) = store.items.values()
+        self.assertEqual((item.quantity, item.quantity_confirmed), (1, False))
+        self.assertIs(store.set_item_count("the oak bookcases", 4), item)
+        store.add_item(ItemReading(category="shelving", name="oak bookcase", quantity=2), "F5")
+        self.assertEqual((item.quantity, item.quantity_confirmed), (4, True))  # a later frame cannot undo it
+        self.assertIsNone(store.set_item_count("grand piano", 1))
+        self.assertIsNone(store.set_item_count("oak bookcase", 0))
+
+    def test_books_listed_as_items_are_dropped_and_bookcases_filed_as_shelving(self):
+        from inventory import clean_item_readings
+        readings = [ItemReading(category="other", name="book row", quantity=7),
+                    ItemReading(category="other", name="stack of paperbacks"),
+                    ItemReading(category="furniture", name="built-in bookcases", quantity=3),
+                    ItemReading(category="decor", name="brass bookends"),
+                    ItemReading(category="appliance", name="espresso machine")]
+        cleaned = {r.name: r.category for r in clean_item_readings(readings)}
+        self.assertEqual(cleaned, {"built-in bookcases": "shelving", "brass bookends": "decor", "espresso machine": "appliance"})
+
+    def test_count_matches_by_head_noun_only_when_unambiguous(self):
+        store = InventoryStore()
+        store.add_item(ItemReading(category="shelving", name="three-section wood bookcase"), "F1")
+        store.add_item(ItemReading(category="furniture", name="leather armchair"), "F1")
+        self.assertEqual(store.set_item_count("teak bookcases", 3).quantity, 3)
+        store.add_item(ItemReading(category="furniture", name="wicker chair"), "F2")
+        store.add_item(ItemReading(category="furniture", name="dining chair"), "F2")
+        self.assertIsNone(store.set_item_count("chairs", 4))  # two different chairs: ask, don't guess
+
+    def test_typed_quantities_count_as_confirmed(self):
+        state = r.inventory_from_request({"items": [{"category": "shelving", "name": "teak bookcase", "quantity": 3}]})
+        self.assertEqual((state["items"][0]["quantity"], state["items"][0]["quantity_confirmed"]), (3, True))
 
     def test_state_round_trip_keeps_ids_unique(self):
         store = InventoryStore.from_state(library().to_state())
@@ -157,10 +193,27 @@ class UnderwritingTests(unittest.TestCase):
         store = self.fully_priced()
         priced(store, "B0001", 900, collectible=True)
         store.add_item(ItemReading(category="art", name="oil portrait"), "F5")
-        priced(store, "I0005", 20000)
+        priced(store, "I0005", 20000, collectible=True)
         review = self.review(store)
         self.assertEqual(review["routing"], "specialist_review")
         self.assertEqual(len(review["specialist_referrals"]), 2)
+
+    def test_posters_and_prints_are_not_sent_to_a_specialist(self):
+        store = self.fully_priced()
+        store.add_item(ItemReading(category="art", name="framed movie poster"), "F5")
+        priced(store, "I0005", 800)
+        self.assertEqual(self.review(store)["routing"], "standard_contents")
+
+    def test_unconfirmed_furniture_counts_are_listed_in_review_and_packet(self):
+        store = self.fully_priced()
+        review = self.review(store)
+        self.assertEqual(review["unconfirmed_counts"], ["teak bookcase: 1 seen on camera, total not confirmed"])
+        store.set_item_count("teak bookcase", 2)
+        self.assertEqual(self.review(store)["unconfirmed_counts"], [])
+        state = store.to_state()
+        room = r.measure_room(state)
+        markdown = r.build_appraisal_packet(state, room, review)["markdown"]
+        self.assertIn("Counts to confirm with the claimant", markdown)
 
     def test_mostly_unpriced_or_unmeasured_needs_more_evidence(self):
         self.assertEqual(self.review(library())["routing"], "needs_more_evidence")
@@ -197,6 +250,13 @@ class HttpTests(unittest.TestCase):
         archive = zipfile.ZipFile(io.BytesIO(self.client.get(f"/api/sessions/{sid}/packet").content))
         self.assertTrue({"appraisal.md", "books.csv", "items.csv", "room.json", "underwriting.json", "evidence/F1.jpg"} <= set(archive.namelist()))
         self.assertEqual(json.loads(archive.read("room.json"))["floor_m2"], 20.0)
+        self.assertEqual(self.client.get(f"/api/sessions/{sid}/floor-plan").status_code, 404)
+        session.floor_plan_image = b"\x89PNGplan"
+        session.floor_plan = {"version": 1, "mime_type": "image/png", "layout": "x", "trigger": "automatic", "room": {}}
+        self.assertEqual(self.client.get(f"/api/sessions/{sid}/floor-plan").content, b"\x89PNGplan")
+        archive = zipfile.ZipFile(io.BytesIO(self.client.get(f"/api/sessions/{sid}/packet").content))
+        self.assertEqual(archive.read("floor_plan.png"), b"\x89PNGplan")
+        self.assertIn("](floor_plan.png)", archive.read("appraisal.md").decode())
         self.assertEqual(self.client.delete(f"/api/sessions/{sid}", headers={"origin": ORIGIN}).json(), {"deleted": True})
         self.assertEqual(self.client.get(f"/api/sessions/{sid}").status_code, 404)
 
@@ -209,7 +269,8 @@ class HttpTests(unittest.TestCase):
 
     def test_health_lists_tools(self):
         health = self.client.get("/api/health").json()
-        self.assertEqual(len(health["tools"]), 6)
+        self.assertEqual(len(health["tools"]), 8)
+        self.assertIn("draw_floor_plan", health["tools"])
 
 
 if __name__ == "__main__":

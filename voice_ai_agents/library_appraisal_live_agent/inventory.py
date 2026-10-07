@@ -26,8 +26,11 @@ except ImportError:
 
 BOOK_MATCH = 0.88
 ITEM_MATCH = 0.85
+ITEM_COUNT_MATCH = 0.6  # looser: the claimant names it in their own words ("the bookshelves")
 MIN_SPINE_CONFIDENCE = 0.35
 _ARTICLES = re.compile(r"^(the|a|an)\s+")
+_BOOKS = re.compile(r"\bbooks?\b|\bnovels?\b|\bpaperbacks?\b|\bhardcovers?\b")
+_SHELVING = re.compile(r"book ?(case|shel(f|ves))|shelving|shelf unit")
 _NON_ALNUM = re.compile(r"[^a-z0-9 ]+")
 
 
@@ -46,6 +49,24 @@ def _authors_agree(a: str, b: str) -> bool:
     if not na or not nb or na in nb or nb in na:
         return True
     return na.split()[-1] == nb.split()[-1] or _similar(na, nb) >= 0.7
+
+
+def _head_noun(name: str) -> str:
+    words = normalize(name).split()
+    return re.sub(r"(?<!s)s$", "", words[-1]) if words else ""
+
+
+def clean_item_readings(readings: list[ItemReading]) -> list[ItemReading]:
+    """Drop books the vision model listed as items, and file every bookcase under shelving so
+    close-up and wide views of the same bookcase can merge."""
+    cleaned = []
+    for reading in readings:
+        name = normalize(reading.name)
+        if _SHELVING.search(name):
+            cleaned.append(reading.model_copy(update={"category": "shelving"}))
+        elif not _BOOKS.search(name):
+            cleaned.append(reading)
+    return cleaned
 
 
 class InventoryStore:
@@ -92,8 +113,10 @@ class InventoryStore:
     def add_item(self, reading: ItemReading, frame_id: str) -> NonBookItem:
         for item in self.items.values():
             if item.category == reading.category and _similar(item.name, reading.name) >= ITEM_MATCH:
-                # The same object seen again: never sum quantities across frames.
-                item.quantity = max(item.quantity, reading.quantity)
+                # The same object seen again: never sum quantities across frames. Identical objects
+                # in different frames merge here too, which is why the agent confirms counts.
+                if not item.quantity_confirmed:
+                    item.quantity = max(item.quantity, reading.quantity)
                 item.description = item.description or reading.description
                 item.size_hint = item.size_hint or reading.size_hint
                 if frame_id not in item.frame_ids:
@@ -106,6 +129,23 @@ class InventoryStore:
             size_hint=reading.size_hint, frame_ids=[frame_id],
         )
         self.items[item.id] = item
+        self.revision += 1
+        return item
+
+    def set_item_count(self, name: str, quantity: int) -> NonBookItem | None:
+        """Apply the claimant's total for an item; the closest name match wins."""
+        if quantity < 1:
+            return None
+        scored = [(_similar(item.name, name), item) for item in self.items.values()]
+        score, item = max(scored, key=lambda pair: pair[0], default=(0.0, None))
+        if item is None or score < ITEM_COUNT_MATCH:
+            # Fall back to the head noun: "teak bookcases" -> the one item that is a "bookcase".
+            noun = _head_noun(name)
+            same = [i for i in self.items.values() if noun and _head_noun(i.name) == noun]
+            if len(same) != 1:
+                return None
+            item = same[0]
+        item.quantity, item.quantity_confirmed = quantity, True
         self.revision += 1
         return item
 

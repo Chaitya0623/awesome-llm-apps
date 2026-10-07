@@ -5,3 +5,4 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 typing-extensions>=4.12
 pillow>=10.0
+openai>=3.0  # only for the optional APPRAISAL_*_PROVIDER=openai settings

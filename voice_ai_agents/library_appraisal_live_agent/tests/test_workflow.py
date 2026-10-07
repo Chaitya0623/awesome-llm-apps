@@ -1,7 +1,10 @@
 """Run the ADK appraisal graph end to end against an offline Gemini stand-in."""
 import sys, unittest, warnings
 from pathlib import Path
+from types import SimpleNamespace as NS
+from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import tests.offline  # noqa: F401,E402  (before any app import)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
@@ -9,7 +12,23 @@ from google.genai import types
 from agent import APP_NAME, create_workflow, root_agent, run_appraisal_workflow
 from inventory import InventoryStore
 from schemas import ItemReading, Locale, RoomView, SpineReading
-from tests.fake_llm import FakeGemini
+from tests.fake_llm import FakeGemini, quote_all
+
+
+class FakeOpenAI:
+    """Responses API stand-in: quotes every queued id and cites one URL, like web_search output."""
+
+    def __init__(self):
+        self.requests = []
+        self.responses = NS(create=self.create)
+
+    async def create(self, model, input, tools):
+        self.requests.append({"model": model, "input": input, "tools": tools})
+        kind = "books" if "book valuation specialist" in input else "items"
+        text = quote_all(input) if kind == "books" else quote_all(input, 1000, 1500, 2500)
+        cited = NS(type="url_citation", url=f"https://{kind}.example/listing")
+        message = NS(type="message", content=[NS(type="output_text", annotations=[cited])])
+        return NS(output_text=text, output=[NS(type="web_search_call"), message])
 
 
 def library(locale=True):
@@ -34,6 +53,25 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["room_measurement"]["floor_m2"], 12.0)
         self.assertEqual(result["underwriting_review"]["routing"], "specialist_review")
         self.assertIn("Lisbon, Portugal (EUR)", result["final_markdown"])
+
+    async def test_openai_provider_prices_with_web_search_and_cites_sources(self):
+        client = FakeOpenAI()
+        with patch("openai.AsyncOpenAI", return_value=client):
+            result = await run_appraisal_workflow(library().to_state(), model=FakeGemini(calls=[]), provider="openai")
+        self.assertEqual(len(client.requests), 2)
+        self.assertEqual(client.requests[0]["tools"], [{"type": "web_search", "user_location": {"type": "approximate", "city": "Lisbon"}}])
+        self.assertIn("Lisbon, Portugal", client.requests[0]["input"])
+        books = {b["id"]: b for b in result["inventory"]["books"]}
+        self.assertEqual(books["B0001"]["price"]["sources"], ["https://books.example/listing"])
+        self.assertEqual(result["appraisal_packet"]["totals"]["grand"]["mid"], 1900)
+        self.assertEqual(result["valuations"]["failed"], [])
+
+    async def test_openai_provider_skips_the_call_when_nothing_is_queued(self):
+        client = FakeOpenAI()
+        with patch("openai.AsyncOpenAI", return_value=client):
+            result = await run_appraisal_workflow(library(locale=False).to_state(), model=FakeGemini(calls=[]), provider="openai")
+        self.assertEqual(client.requests, [])
+        self.assertTrue(all(b["status"] == "pending" for b in result["inventory"]["books"]))
 
     async def test_no_location_skips_the_valuation_agents(self):
         fake = FakeGemini(calls=[])
